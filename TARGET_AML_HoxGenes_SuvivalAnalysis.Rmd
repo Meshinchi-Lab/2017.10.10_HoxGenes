@@ -1,0 +1,816 @@
+---
+title: "HOX Genes Survival Analysis"
+output: html_document
+---
+
+
+```{r setup}
+library(knitr)
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),tidy=TRUE, fig.align='center', fig.height = 8, fig.width = 10)
+knitr::opts_knit$set(root.dir = '~/COG_Meetings_Analysis/2017.10.10_HoxGenes/')
+```
+
+
+```{r message=FALSE}
+library(magrittr)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(reshape2)
+getwd()
+```
+
+
+```{r}
+source("~/scripts/Survival_Analysis/Survplot_Functions_2017.03.31.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/rmDupGenes_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/ggplot_Themes_Function.r")
+source("~/scripts/ConversionScripts/Merge_Cat_FixDupIDs_Function.r")
+source("~/scripts/RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/Heatmaps_Function.r")
+```
+
+
+
+#Define Functions To Be Used
+
+```{r}
+selTPM <- function(TPM,geneList){
+  #TPM must have genes as rownames
+  
+  df <- TPM[geneList,] %>%
+  mutate(Gene=row.names(.)) %>%
+  select(Gene, everything()) %>%
+  set_rownames(.$Gene)
+  
+  return(df)
+}
+```
+
+
+```{r}
+meltTPM <- function(TPM){
+  df <- TPM %>% 
+  melt() %>%
+  set_colnames(c("Gene", "USI", "TPM")) %>%
+  mutate(Group=ifelse(grepl("^BM|^RO", USI), "BM", "AML"))
+  
+  return(df)
+}
+```
+
+
+```{r}
+distTPM <- function(meltedTPM, bw=5){
+ p <-  ggplot(meltedTPM, aes(x=TPM, fill=Group)) + 
+  geom_histogram(binwidth = bw) + 
+  geom_density() + 
+  facet_wrap(~ Gene, nrow=5, ncol=5, scale="free") + 
+  theme_numX
+ 
+ return(p)
+}
+```
+
+```{r}
+# https://stackoverflow.com/questions/26003574/r-dplyr-mutate-use-dynamic-variable-names
+defineExp <- function(mergedCDE,cols){
+  #mergedCDE is the result of merge_CDE_Expn() 
+  #cols is the expression columns 
+  for (col in cols){
+    colname <- paste(col, "Expressors", sep=".")
+    mergedCDE <- mergedCDE %>% 
+      mutate(!!colname := ifelse(.[,col] >= 1, "Expressor", "Non-Expressor"))
+  }
+  return(mergedCDE)
+}
+```
+
+```{r}
+multipleKM <- function(mergedCDE,cohort,source){
+  if (source == "CDE"){
+    expressorCols <- grep("Expressors",  colnames(mergedCDE), value = TRUE)
+  }else if (source == "survminer"){
+    expressorCols <- grep("HOX",  colnames(mergedCDE), value = TRUE)
+  }
+  
+  KM <- data.frame()
+  for (c in expressorCols){
+    km <- KM.plots(mergedCDE, groupBy = "X", type="OS",covariate = c, cohort=cohort)
+    KM <- rbind(KM,km)
+  }
+  return(KM)
+}
+```
+
+
+```{r}
+log2Ratio <- function(ExpnMatrix, genes,log2 = FALSE) {
+
+   
+    BM.idx <- grepl("^BM|^RO", colnames(ExpnMatrix))
+  
+    if (log2 == FALSE) {
+        BM <- log2(ExpnMatrix[genes, BM.idx] + 1)
+        AML <- log2(ExpnMatrix[genes, ! BM.idx] + 1)
+    } else if (log2 == TRUE) {
+        BM <- ExpnMatrix[genes, BM.idx]
+        AML <- ExpnMatrix[genes, ! BM.idx]
+    }
+    
+    BM.means <- rowMeans(BM)  #genes are rows, so use rowmeans for gene means. 
+    
+    # vectorized, so substract log2 mean from each patients gene expression for log2 ratios
+    log2Ratio <- apply(AML, 2, function(x) x - BM.means)  
+    
+    return(log2Ratio)
+}
+```
+
+
+```{r}
+survminer <- function(CDE, cols,cohort){
+  library(dplyr)
+  library(survminer)
+  # HoxCols <- grep("^HOX", colnames(CDE), value=TRUE) %>% 
+  #   grep("Exp", ., invert=TRUE, value=TRUE)
+  
+  if (cohort == "0531"){
+    t <- "Overall.Survival.Time.in.Days"
+    e <- "OS.ID"
+    
+    t2 <- "Event.Free.Survival.Time.in.Days"
+    e2 <- "Event.ID"
+    id <- "TARGET.USI.1"
+  } else if (cohort == "1031"){
+    t <- "yrsos"
+    e <- "osi"
+    
+    t2 <- "yrsefs"
+    e2 <- "efsi"
+    id <- "USI"
+  }
+  
+  #functions to extract the plots individually
+  getmaxstat <- function(plot,col){plot[[col]]$maxstat}
+  gethist <- function(plot,col){plot[[col]]$distribution}
+  
+  #Results of Log-Rank Stats
+  res.cut <- surv_cutpoint(CDE, 
+                         time = t,
+                         event = e,
+                         variables = cols, 
+                         progressbar = FALSE)
+  
+  #Cut-pointd dataframe
+  cp <- summary(res.cut)
+  
+  #plot the log-rank statistics
+  p <- plot(res.cut, cols, palette="npg",
+            bins=20, newpage=FALSE)
+  
+  #extrat the plots individually. 
+  maxstats.p <- setNames(lapply(cols, getmaxstat, plot=p), cols)
+  hist.p <- setNames(lapply(cols, gethist, plot=p),cols)
+  
+  #categorize high and low expressors
+  res.cat <- surv_categorize(res.cut)
+  
+  #merge in EFS information. same order as input CDE.
+  merged <- res.cat %>% 
+    mutate(X=rep("AML", nrow(.))) %>%
+    cbind(CDE[,c(id,t2,e2)], .)
+  
+  #Create KM plots
+  KM_SurvCut <- multipleKM(merged, cohort = cohort, source = "survminer")
+
+  res <- list(res.cut, cp, maxstats.p, hist.p, res.cat, merged, KM_SurvCut )
+  names(res) <- c("res.cut", "cutpoints", "maxstats.plot", "hist.plot", "res.cat", "merged", "KM_SurvCut")
+
+  return(res)
+  
+}
+```
+
+
+
+#Read in the Clinical data
+
+```{r}
+CDE.0531 <- read.csv("~/reference_mapping-files/TARGET_AML_current_asof_june30_2016_UPDATED_RhondaEdit_2017.06.08.csv", row.names = 1, na.strings = c("N/A"))
+
+rownames(CDE.0531) <- CDE.0531$TARGET.USI.1
+head(CDE.0531[,1:5])
+```
+
+```{r}
+dim(CDE.0531)
+```
+
+```{r}
+CDE.1031 <- read.csv("~/reference_mapping-files/TARGET_AML_AAML1031_merged_CDE_Cleaned_28Sept2017.csv", 
+                     stringsAsFactors = FALSE, row.names = 1)
+
+CDE.1031 <- CDE.1031 %>% 
+  filter(! is.na(efsi) ) %>%
+  mutate(X=rep("AML", nrow(.))) %>%
+  set_rownames(.$USI)
+
+head(CDE.1031[,1:5])
+```
+
+```{r}
+dim(CDE.1031)
+```
+
+#Read in the TPM Values 
+
+```{r}
+TPM.0531 <- read.csv("ExpressionData/allTPM_withEnsemblID_BCCA28Apr2016.csv", stringsAsFactors = FALSE)
+TPM.0531 <- TPM.0531[,-2]
+dim(TPM.0531)
+```
+
+```{r}
+TPM.1031 <- read.csv("ExpressionData/TARGET_AML_AAML1031_RNASeq_TPM.csv", stringsAsFactors = FALSE)
+TPM.1031 <- TPM.1031[,-2]
+colnames(TPM.1031) <- str_split_fixed(colnames(TPM.1031), pattern = "\\.", n=2)[,1]
+dim(TPM.1031)
+```
+
+```{r}
+head(TPM.0531)
+```
+
+```{r}
+head(TPM.1031)
+```
+
+
+#Remove Duplicate Genes 
+
+```{r}
+TPM.0531.rm <- rmDupGenes(TPM.0531,geneCol = "geneSymbol")
+
+rmDups.0531 <- TPM.0531.rm$remDups
+dim(rmDups.0531 ) #51,573 genes adn 494 samples
+```
+
+```{r}
+TPM.1031.rm <- rmDupGenes(TPM.1031,geneCol = "geneSymbol")
+
+rmDups.1031 <- TPM.1031.rm$remDups
+dim(rmDups.1031) #51,573 genes and 1,111 samples
+```
+
+```{r}
+# write.csv(rmDups.0531, "TARGET_AML_0531_TPM_dupGenesRemoved.csv")
+# write.csv(rmDups.1031, "TARGET_AML_1031_TPM_dupGenesRemoved.csv")
+```
+
+
+
+
+#Read in the Differentially Expressed Genes 
+
+```{r}
+NSD1.BM <- read.csv("DEGs/0531_lowDepth_Results/TARGET_AML_NUP98.NSD1.statusvsNormalBM_DEGs.csv", stringsAsFactors = FALSE)
+
+NSD1.BM.Hoxes <- grep("^HOX", NSD1.BM$X, value=TRUE)
+# NSD1.BM.Hoxes
+```
+
+```{r}
+NSD1.AML <- read.csv("DEGs/0531_lowDepth_Results/TARGET_AML_NUP98.NSD1vsOtherAML_DEGs.csv", stringsAsFactors = FALSE)
+
+NSD1.AML.Hoxes <- grep("^HOX", NSD1.AML$X, value = TRUE)
+# NSD1.AML.Hoxes
+```
+
+```{r}
+KDM5A.BM <- read.csv("DEGs/0531_lowDepth_Results/TARGET_AML_NUP98.KDM5A.statusvsNormalBM_DEGs.csv", stringsAsFactors = FALSE)
+
+KDM5A.BM.Hoxes <- grep("^HOX", KDM5A.BM$X, value = TRUE)
+# KDM5A.BM.Hoxes
+```
+
+
+```{r}
+KDM5A.AML <- read.csv("DEGs/0531_lowDepth_Results/TARGET_AML_NUP98.KDM5AvsOtherAML_DEGs.csv", stringsAsFactors=FALSE)
+
+KDM5A.AML.Hoxes <- grep("^HOX", KDM5A.AML$X, value=TRUE)
+# KDM5A.AML.Hoxes
+```
+
+
+```{r}
+FLT3.AML <- read.csv("DEGs/1031_highDepth_Results/TARGET_AML_1031_FLT3-ITD.Event_vs_NoFLT3-ITD.Event_DEGs.csv", stringsAsFactors=FALSE)
+
+FLT3.AML.Hoxes <- grep("^HOX", FLT3.AML$gene, value=TRUE)
+# FLT3.AML.Hoxes
+```
+
+
+#Create a composite list of Hoxes
+
+```{r}
+HOX <- NULL
+
+for (list in ls(pattern = "Hoxes")){
+  h <- get(list)
+  HOX <- unique(c(HOX,h))
+}
+
+HOX[order(HOX)]
+```
+
+
+A total of 25 Hox genes were found as differentially expressed in NUP98-NSD1, NUP98-KDM5A, and FLT-ITD with an Event. 
+
+
+#Distribution of Expression 
+
+
+```{r}
+Hox.TPM.0531 <- selTPM(rmDups.0531, HOX)
+Hox.TPM.1031 <- selTPM(rmDups.1031, HOX)
+
+# head(Hox.TPM.0531[,1:5])
+# head(Hox.TPM.1031[,1:5])
+```
+
+```{r message=FALSE}
+Hox.0531.Dist <- meltTPM(Hox.TPM.0531)
+Hox.1031.Dist <- meltTPM(Hox.TPM.1031)
+
+head(Hox.0531.Dist)
+# head(Hox.1031.Dist)
+```
+
+```{r fig.width=16, fig.height=10}
+p0531 <- distTPM(Hox.0531.Dist)
+
+# pdf("TARGET_AML_0531_HoxGenes_Distribution_Histograms .pdf", width=17, height = 10)
+p0531
+# dev.off()
+```
+
+
+```{r fig.width=17, fig.height=10}
+p1031 <- distTPM(Hox.1031.Dist, bw=5)
+
+# pdf("TARGET_AML_1031_HoxGenes_Distribution_Histograms.pdf", width=17, height = 10)
+p1031
+# dev.off()
+```
+
+
+
+Overall, can see that the data follows a poisson distribution with a low mean and majority of patietns will be non expressors (zero TPM)
+
+Thus my first approach is simply to use Non-Expressors (TPM < 1) and Expressors (TPM >= 1). 
+Second approach will be from survMiner cut-point. 
+
+
+#Merge the TPM and Clinical Data 
+
+```{r}
+Hox.Merge.0531 <- merge_CDE_Expn(CDE.0531, Hox.TPM.0531, rownames(Hox.TPM.0531))
+
+head(Hox.Merge.0531[,1:5])
+# dim(Hox.Merge.0531) #446 patients 
+```
+
+
+```{r}
+Hox.Merge.1031 <- merge_CDE_Expn(CDE.1031, Hox.TPM.1031, rownames(Hox.TPM.1031))
+
+head(Hox.Merge.1031[,1:5]) #643 patients
+# dim(Hox.Merge.1031)
+```
+
+
+
+#Perform Survival Analysis 
+
+1) Use 1 TPM as a cut-off 
+
+2) Survminer to find cut-off
+
+3) Survminer with FCs to find cut-off (?)
+
+3) CoxPH with Quantitive TPM values 
+
+
+
+#Survival between Expressors and Non-Expressors
+
+```{r}
+HoxCols <- grep("HOX", colnames(Hox.Merge.0531), value=TRUE) %>% 
+  grep("Expressors",., value=TRUE, invert=TRUE)
+
+HoxCols[1:10]
+```
+
+Expressors have TPM >= 1, non-expressors TPM <= 1
+
+```{r}
+Hox.Merge.0531 <- defineExp(Hox.Merge.0531, HoxCols) %>%
+  set_rownames(.$TARGET.USI.1)
+
+ratio.0531 <- log2Ratio(rmDups.0531, genes=HOX) %>%
+  set_rownames(paste(rownames(.), "FC", sep="."))
+
+Hox.Merge.0531 <- merge_CDE_Expn(Hox.Merge.0531,ratio.0531, rownames(ratio.0531))
+
+# head(Hox.Merge.0531[,1:5])
+# dim(Hox.Merge.0531) #446 samples
+```
+
+
+```{r}
+Hox.Merge.1031 <- defineExp(Hox.Merge.1031, HoxCols) %>%
+  set_rownames(.$USI)
+
+ratio.1031 <- log2Ratio(rmDups.1031, genes=HOX) %>%
+  set_rownames(paste(rownames(.), "FC", sep="."))
+
+Hox.Merge.1031 <- merge_CDE_Expn(Hox.Merge.1031,ratio.1031, rownames(ratio.1031))
+
+# head(Hox.Merge.1031[,1:5])
+# dim(Hox.Merge.1031) #634 samples
+```
+
+
+```{r}
+# write.csv(Hox.Merge.0531, "TARGET_AML_0531_CDE_Merged_TPM.csv", row.names = FALSE)
+# write.csv(Hox.Merge.1031, "TARGET_AML_1031_CDE_Merged_TPM.csv", row.names = FALSE)
+```
+
+
+```{r}
+m <- list(Hox.Merge.0531, Hox.Merge.1031)
+c <- c("0531", "1031")
+```
+
+```{r message=FALSE}
+KMplots <- mapply(multipleKM, m, c,
+                  MoreArgs=list(source="CDE"),SIMPLIFY = FALSE) %>%
+  set_names(c)
+
+KMplots$`0531`$X <- HoxCols
+KMplots$`1031`$X <- HoxCols
+head(KMplots$`0531`)
+```
+
+```{r}
+# save(KMplots, file="0531_1031_1TPM_CutOff_KMplots.RData")
+```
+
+```{r}
+# pdf("TARGET_AML_0531_OS_EFS_KMplots_.pdf", width=7, height = 5)
+KMplots$`0531`$OS
+KMplots$`0531`$EFS
+# dev.off()
+```
+
+
+```{r}
+# pdf("TARGET_AML_1031_OS_EFS_KMplots_.pdf", width=7, height = 5)
+KMplots$`1031`$OS
+KMplots$`1031`$EFS
+# dev.off()
+```
+
+
+Results: there are some discrepancies with which Hox genes show the most seperation. However, Hoxa9, Hoxa10, Hoxa6, Hox-AS4, Hoxc4, hoxa4, hoxa2, Hoxa3, Hoxa5, Hoxa1, Hoxa7, Hoxa11 (not quite sig in 0531)  shows a seperation in both cohorts. 
+
+
+#Survminer with Cut-Point
+
+
+```{r}
+library(survminer)
+```
+
+Determine the optimal cutpoint for one or multiple continuous variables at once, using the maximally selected rank statistics from the 'maxstat' R package. This is an outcome-oriented methods providing a value of a cutpoint that correspond to the most significant relation with outcome (here, survival).
+
+```{r}
+sm.0531 <- survminer(Hox.Merge.0531, HoxCols, "0531")
+# save(sm.0531, file="0531_Surminer_Cutoffs.RData")
+```
+
+
+```{r}
+# pdf("TARGET_AML_0531_Survminer_Cutoffs_KMplots.pdf", height=5, width = 7)
+sm.0531$KM_SurvCut$OS
+sm.0531$KM_SurvCut$EFS
+# dev.off()
+```
+
+
+```{r}
+# pdf("TARGET_AML_0531_Survminer_Cutoffs_maxstat_plots.pdf", height=5, width = 7 )
+sm.0531$maxstats.plot
+# dev.off()
+```
+
+
+```{r}
+# pdf("TARGET_AML_0531_Survminer_Cutoffs_histogram_plots.pdf", height=5, width = 7)
+sm.0531$hist.plot
+# dev.off()
+```
+
+
+```{r}
+# pdf("1031_TPM_CutOffs_Histogram.pdf")
+h <- hist(sm.0531$cutpoints$cutpoint, 
+     breaks = seq(0,10,by=0.5), 
+     xlim = c(0,10),
+     xaxt='n',
+     col = "blue")
+axis(side=1, at=seq(0,10,by=1), labels=seq(0,10,by=1)) #7/25 Hoxes had cutpoint of > 1TPM.
+# dev.off()
+```
+
+
+```{r}
+sm.1031 <- survminer(Hox.Merge.1031, HoxCols, "1031") 
+# save(sm.1031, file="1031_Survminer_cutoffs.RData")
+```
+
+```{r}
+# pdf("TARGET_AML_1031_Survminer_Cutoffs_KMplots.pdf", height=5, width = 7)
+sm.1031$KM_SurvCut$OS
+sm.1031$KM_SurvCut$EFS
+# dev.off()
+```
+
+```{r}
+# pdf("TARGET_AML_1031_Survminer_Cutoffs_maxstat_plots.pdf", height=5, width = 7 )
+sm.1031$maxstats.plot
+# dev.off()
+```
+
+```{r}
+# pdf("TARGET_AML_1031_Survminer_Cutoffs_histogram_plots.pdf", height=5, width = 7)
+sm.1031$hist.plot
+# dev.off()
+```
+
+
+#Survminer with Fold-Changes
+
+From Psych: 
+
+"geometric.mean" <- 
+function(x,na.rm=TRUE){ if (is.null(nrow(x))) {exp(mean(log(x),na.rm=TRUE)) } else {
+exp(apply(log(x),2,mean,na.rm=na.rm))} }
+
+```{r}
+FC.cols <- grep("\\.FC", colnames(Hox.Merge.0531), value=TRUE)
+FC.cols[1:5]
+```
+
+```{r}
+fc.0531 <- survminer(Hox.Merge.0531,FC.cols,cohort = "0531")
+# save(fc.0531, file="0531_Survminer_FC_cutpoints.RData")
+```
+
+```{r}
+# pdf(file = "TARGET_AML_0531_Survminer_FC_cutpoints_KMplots.pdf", height = 5, width = 7)
+fc.0531$KM_SurvCut$OS
+fc.0531$KM_SurvCut$EFS
+# dev.off()
+```
+
+```{r}
+# pdf(file="TARGET_AML_0531_Survminer_FC_cutpoints_Histograms.pdf")
+fc.0531$hist.plot
+# dev.off()
+```
+
+```{r}
+# pdf(file="TARGET_AML_0531_Survminer_FC_cutpoints_maxstats.pdf")
+fc.0531$maxstats.plot
+# dev.off()
+```
+
+
+```{r}
+fc.1031 <- survminer(Hox.Merge.1031, FC.cols, cohort="1031")
+# save(fc.1031, file="1031_Survminer_FC_cutoffs.RData")
+```
+
+```{r}
+# pdf(file="TARGET_AML_1031_Survminer_FC_cutpoints_KMplots.pdf", height = 5, width = 7)
+fc.1031$KM_SurvCut$OS
+fc.1031$KM_SurvCut$EFS
+# dev.off()
+```
+
+```{r}
+# pdf(file="TARGET_AML_1031_Survminer_FC_cutpoints_maxstat_plots.pdf", height = 5, width=7)
+fc.1031$maxstats.plot
+# dev.off()
+```
+
+```{r}
+# pdf(file="TARGET_AML_1031_Survminer_FC_cutpoints_histogram_plots.pdf", height = 5, width = 7)
+fc.1031$hist.plot
+# dev.off()
+```
+
+```{r}
+# pdf("1031_FC_CutOffs_Histogram.pdf")
+hist(fc.1031$cutpoints$cutpoint, 
+     xlim = c(-2,5),breaks = seq(-2,5,by=0.5),
+     xaxt='n',
+     col = "blue")
+axis(side=1, at=seq(-2,5,by=1), labels=seq(-2,5,by=1)) 
+# dev.off()
+```
+
+
+
+
+#0531 Annotation Heatmap
+
+
+```{r}
+ph <- Hox.Merge.0531$FLT3.ITD.positive. %>% set_names(Hox.Merge.0531$TARGET.USI.1)
+
+d.0531 <- dendrograms(rmDups.0531, ph, HOX, method = "ward.D2")
+summary(d.0531)
+```
+
+```{r}
+annodf <- Hox.Merge.0531[,c("TARGET.USI.1","FLT3.ITD.positive.", "NPM.mutation", "CEBPA.mutation")] %>%
+  inner_join(.,fc.0531$merged, by="TARGET.USI.1") %>%
+  select(TARGET.USI.1, FLT3.ITD.positive., NPM.mutation, CEBPA.mutation, grep("FC", colnames(.))) %>%
+  select(TARGET.USI.1, FLT3.ITD.positive., NPM.mutation, CEBPA.mutation, HOXC4.FC, everything()) %>%
+  transmute_all(funs(as.character(.))) %>%
+  set_rownames(.$TARGET.USI.1) %>%
+  select(-TARGET.USI.1)
+head(annodf)
+```
+
+
+```{r}
+annocolors <- colorCodes_aheatmap(annodf)
+
+annocolors[grepl("HOXB", names(annocolors))] <- lapply(annocolors[grepl("HOXB", names(annocolors))], function(x) x=c("high"="maroon","low"="orchid"))
+
+
+annocolors[grepl("HOXA", names(annocolors))] <- lapply(annocolors[grepl("HOXA", names(annocolors))], function(x) x=c("high"="cornflowerblue","low"="navajowhite2"))
+
+annocolors[["HOXC4.FC"]] <- c("high"="saddlebrown","low"="lightcoral")
+
+# annocolors
+```
+
+
+```{r fig.height=16}
+# tiff(file="0531_Hoxgenes_cluster_Heatmap.tiff", height = 28, width=22,units = "in",res=600)
+annotationHeatmap(d.0531$expnData,d.0531$c2, d.0531$c1, annodf, annocolors, main="Hox Genes in 0531")
+# dev.off()
+```
+
+
+```{r fig.width=10, fig.height=5}
+# tiff("0531_HoxGenes_ColorDend.tiff",height = 5, width=12,units = "in",res=600 )
+colorDends(d.0531$c1, annocolors$FLT3.ITD.positive., ph, textsize = c(0.15,6))
+# dev.off()
+```
+
+
+```{r fig.width=10, fig.height=5}
+allhoxcluster <- cut(as.dendrogram(d.0531$c1), h=150)
+
+# tiff("0531_HoxGenes_ColorDend_CutForHoxExpressors.tiff",height = 5, width=12,units = "in",res=600 )
+colorDends(allhoxcluster$lower[[3]],annocolors$FLT3.ITD.positive., ph, textsize = c(0.5,1.5))
+# dev.off()
+```
+
+
+```{r}
+panHoxExpr.0531 <- labels(allhoxcluster$lower[[3]])
+# length(panHoxExpr.0531) #144
+head(panHoxExpr.0531)
+```
+
+
+
+
+#1031 Annotation Heatmap 
+
+
+
+```{r}
+adf <- Hox.Merge.1031[,c("USI", "FLT3.ITD","CEBPA","NPM1")] %>% 
+  inner_join(., fc.1031$merged, by="USI") %>%
+  select(USI,FLT3.ITD, CEBPA, NPM1, grep("FC", colnames(.))) %>%
+  select(USI,FLT3.ITD, CEBPA, NPM1, HOXC4.FC, everything(.)) %>%
+  transmute_all(funs(as.character(.))) %>%
+  set_rownames(.$USI) %>%
+  select( -USI)
+
+adf <- matchMatrix(adf,d.1031$expnData)
+
+head(adf[,1:5])
+```
+
+```{r}
+acol <- colorCodes_aheatmap(adf)
+
+acol[grepl("HOXB", names(acol))] <- lapply(acol[grepl("HOXB", names(acol))], function(x) x=c("high"="maroon","low"="orchid"))
+
+acol[grepl("HOXA", names(acol))] <- lapply(acol[grepl("HOXA", names(acol))], function(x) x=c("high"="cornflowerblue","low"="navajowhite2"))
+
+acol[["HOXC4.FC"]] <- c("high"="saddlebrown","low"="lightcoral")
+
+```
+
+
+```{r}
+p <- adf$HOXA9.FC %>% set_names(rownames(adf))
+
+d.1031 <- dendrograms(rmDups.1031, p, HOX,method="ward.D2" )
+
+```
+
+
+
+
+```{r fig.height=16}
+# tiff(file="1031_Hoxgenes_cluster_Heatmap_A.tiff", height = 28, width=22,units = "in",res=600)
+annotationHeatmap(d.1031$expnData, d.1031$c2, d.1031$c1, adf, acol,main="Hox Genes in 1031")
+# dev.off()
+```
+
+
+```{r fig.width=10, fig.height=3}
+# tiff("1031_HoxGenes_ColorDend.tiff",height = 5, width=12,units = "in",res=600)
+colorDends(d.1031$c1, acol$HOXA9.FC, p, textsize = c(0.1,6))
+# dev.off()
+```
+
+
+```{r}
+allhoxcluster.1031 <- cut(as.dendrogram(d.1031$c1), h=125)
+```
+
+
+#Investigate the copy number differences in the HOX gene clusters. 
+
+
+
+#Session Info 
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
+#Example from Survminer
+
+library(survminer)
+
+data(myeloma)
+head(myeloma)
+
+1. Determine the optimal cutpoint of variables
+res.cut <- surv_cutpoint(myeloma, time = "time", event = "event",
+   variables = c("DEPDC1", "WHSC1", "CRIM1"))
+
+summary(res.cut)
+
+2. Plot cutpoint for DEPDC1
+palette = "npg" (nature publishing group), see ?ggpubr::ggpar
+plot(res.cut, "DEPDC1", palette = "npg")
+
+ 3. Categorize variables
+res.cat <- surv_categorize(res.cut)
+head(res.cat)
+
+4. Fit survival curves and visualize
+library("survival")
+fit <- survfit(Surv(time, event) ~DEPDC1, data = res.cat)
+ggsurvplot(fit, data = res.cat, risk.table = TRUE, conf.int = TRUE)
+
+
+
+
+
+
+
+
+
+
+
+
+
